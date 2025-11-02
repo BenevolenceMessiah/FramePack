@@ -1,0 +1,48 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes; adjust as you like
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+permissions:
+  contents: write             # needed to update your fork
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: sync-upstream
+      cancel-in-progress: false
+    steps:
+      - name: Determine default branch
+        id: b
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Sync with upstream via GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.b.outputs.branch }}"
+          echo "Syncing $GITHUB_REPOSITORY on branch '$branch' with upstream…"
+          # This calls the official "merge-upstream" endpoint.
+          # On success, your fork's branch is fast-forwarded/merged to match upstream.
+          set +e
+          out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch="$branch" 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ $status -ne 0 ]; then
+            echo "::warning::Sync failed (likely conflicts or diverged history)."
+            echo "::warning::Consider a PR-based sync action (see below) so you can review conflicts."
+            # Don’t fail the workflow; just warn so it keeps trying on the next schedule
+          fi
