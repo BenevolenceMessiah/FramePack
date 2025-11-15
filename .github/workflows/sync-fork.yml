@@ -1,48 +1,288 @@
 name: Sync fork from upstream
 
 on:
+  # Adjust to taste; this runs every 4 hours
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes; adjust as you like
-  workflow_dispatch:          # allow manual runs from the Actions tab
+    - cron: "0 */4 * * *"
+  # Manual run from the Actions tab
+  workflow_dispatch:
 
 permissions:
-  contents: write             # needed to update your fork
+  contents: write          # needed for gh repo sync + pushing PR branches
+  pull-requests: write     # needed to create sync PRs
+  issues: write            # needed to open/update failure issues
 
 jobs:
-  sync:
+  sync-fork:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: sync-upstream
-      cancel-in-progress: false
-    steps:
-      - name: Determine default branch
-        id: b
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          branch=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+    timeout-minutes: 15
 
-      - name: Sync with upstream via GitHub API
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # Avoid overlapping syncs for the same repository
+    concurrency:
+      group: sync-upstream-${{ github.repository }}
+      cancel-in-progress: false
+
+    # Baseline env: GITHUB_TOKEN is always present; SYNC_FORK_PAT is optional
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SYNC_FORK_PAT: ${{ secrets.SYNC_FORK_PAT }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GITHUB_TOKEN }}
+
+      - name: Configure gh auth token (PAT preferred if available)
         run: |
           set -euo pipefail
-          branch="${{ steps.b.outputs.branch }}"
-          echo "Syncing $GITHUB_REPOSITORY on branch '$branch' with upstream…"
-          # This calls the official "merge-upstream" endpoint.
-          # On success, your fork's branch is fast-forwarded/merged to match upstream.
-          set +e
-          out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch="$branch" 2>&1)
-          status=$?
-          set -e
-          echo "$out"
-          if [ $status -ne 0 ]; then
-            echo "::warning::Sync failed (likely conflicts or diverged history)."
-            echo "::warning::Consider a PR-based sync action (see below) so you can review conflicts."
-            # Don’t fail the workflow; just warn so it keeps trying on the next schedule
+
+          if [ -n "${SYNC_FORK_PAT:-}" ]; then
+            echo "Using SYNC_FORK_PAT for gh auth."
+            echo "GH_TOKEN=${SYNC_FORK_PAT}" >> "$GITHUB_ENV"
+          else
+            echo "Using GITHUB_TOKEN for gh auth."
+            echo "GH_TOKEN=${GITHUB_TOKEN}" >> "$GITHUB_ENV"
           fi
+
+      - name: Show basic context
+        run: |
+          set -euo pipefail
+          echo "Repository : $GITHUB_REPOSITORY"
+          echo "Actor      : $GITHUB_ACTOR"
+          echo "Ref        : $GITHUB_REF"
+          echo "Workflow   : $GITHUB_WORKFLOW"
+          echo "Run ID     : $GITHUB_RUN_ID"
+          echo
+          echo "GitHub CLI version:"
+          gh --version
+
+      - name: Determine fork / upstream / default branch
+        id: repo-info
+        run: |
+          set -euo pipefail
+
+          echo "Querying repository metadata via gh repo view…"
+
+          # Single GraphQL call for all needed fields
+          info=$(gh repo view "$GITHUB_REPOSITORY" --json isFork,defaultBranchRef,parent)
+          echo "Raw info:"
+          echo "$info"
+          echo
+
+          is_fork=$(echo "$info" | jq -r '.isFork')
+          default_branch=$(echo "$info" | jq -r '.defaultBranchRef.name // empty')
+          upstream_repo=$(echo "$info" | jq -r '.parent.nameWithOwner // empty')
+
+          echo "isFork        : $is_fork"
+          echo "default_branch: $default_branch"
+          echo "upstream_repo : $upstream_repo"
+          echo
+
+          echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+
+          if [ "$is_fork" != "true" ]; then
+            echo "::notice::This repository is not a fork; nothing to sync."
+            # We exit 0; later steps check is_fork before doing work
+            exit 0
+          fi
+
+          if [ -z "$upstream_repo" ] || [ "$upstream_repo" = "null" ]; then
+            echo "::notice::Repository is marked as a fork, but no parent/upstream is set. Nothing to sync."
+            exit 0
+          fi
+
+          if [ -z "$default_branch" ] || [ "$default_branch" = "null" ]; then
+            echo "::error::Could not determine default branch for $GITHUB_REPOSITORY."
+            exit 1
+          fi
+
+          echo "branch=$default_branch" >> "$GITHUB_OUTPUT"
+          echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+
+      - name: Sync with upstream via gh repo sync (with retries)
+        id: sync
+        run: |
+          set -euo pipefail
+
+          # If repo-info said it's not a fork, treat as success and skip
+          if [ "${{ steps.repo-info.outputs.is_fork }}" != "true" ]; then
+            echo "::notice::Skipping sync because this repository is not an active fork."
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          branch="${{ steps.repo-info.outputs.branch }}"
+          upstream_repo="${{ steps.repo-info.outputs.upstream_repo }}"
+
+          echo "Attempting to sync fork '$GITHUB_REPOSITORY' branch '$branch' from upstream '$upstream_repo'..."
+          echo "Using gh repo sync (GitHub's recommended way to sync forks)."
+
+          max_retries=3
+          retry_delay=10
+          attempt=1
+          conflict=false
+          diverged=false
+
+          while [ $attempt -le $max_retries ]; do
+            echo "===== Sync attempt $attempt of $max_retries ====="
+
+            set +e
+            # Sync remote fork from its parent on a specific branch.
+            # Use a local environment override for the authentication token when invoking gh
+            response=$(GH_TOKEN="$GH_TOKEN" gh repo sync "$GITHUB_REPOSITORY" --branch "$branch" 2>&1)
+            status=$?
+            set -e
+
+            echo "$response"
+            echo
+
+            if [ $status -eq 0 ]; then
+              echo "::notice::Successfully synced '$branch' with upstream on attempt $attempt."
+              echo "success=true" >> "$GITHUB_OUTPUT"
+              echo "attempt=$attempt" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Classify errors so we know whether to fall back to a PR
+            if echo "$response" | grep -qi "conflict"; then
+              echo "::warning::Merge conflict detected while syncing '$branch'."
+              conflict=true
+              break
+            elif echo "$response" | grep -qi "no common ancestor"; then
+              echo "::warning::No common ancestor found; histories have diverged."
+              diverged=true
+              break
+            elif echo "$response" | grep -qi "is not tracking"; then
+              echo "::warning::Branch '$branch' is not tracking the expected upstream; treating as diverged."
+              diverged=true
+              break
+            elif echo "$response" | grep -qi "rate limit"; then
+              echo "::warning::GitHub API rate limit encountered; backing off before retry…"
+              sleep "$((retry_delay * attempt))"
+            elif echo "$response" | grep -qi "server error"; then
+              echo "::warning::Server-side error from GitHub; will retry…"
+              sleep "$((retry_delay * attempt))"
+            else
+              echo "::warning::Unexpected error while syncing; may retry if attempts remain."
+            fi
+
+            if [ $attempt -lt $max_retries ]; then
+              echo "Retrying in ${retry_delay}s…"
+              sleep "$retry_delay"
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          # If we get here, sync did NOT succeed
+          echo "success=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$conflict" = "true" ]; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$diverged" = "true" ]; then
+            echo "diverged=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::warning::Failed to sync '$branch' with upstream after $max_retries attempts."
+
+      - name: Create PR for manual sync (if conflicts/divergence)
+        if: steps.sync.outputs.success == 'false' && (steps.sync.outputs.conflict == 'true' || steps.sync.outputs.diverged == 'true')
+        id: pr
+        run: |
+          set -euo pipefail
+
+          branch="${{ steps.repo-info.outputs.branch }}"
+          upstream_repo="${{ steps.repo-info.outputs.upstream_repo }}"
+
+          pr_branch="sync-upstream-${branch}-$(date +%Y%m%d-%H%M%S)"
+
+          echo "Creating sync PR from upstream '$upstream_repo' into '$GITHUB_REPOSITORY' on branch '$branch'…"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Ensure an upstream remote exists pointing at the parent repo
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream "https://github.com/${upstream_repo}.git"
+          fi
+
+          git fetch upstream "$branch"
+
+          # Create a local branch that matches upstream's branch tip
+          git checkout -B "$pr_branch" "upstream/$branch"
+
+          # Push this branch to the fork
+          git push -u origin "$pr_branch" --force
+
+          # Build PR body message. Use ANSI C-style $'' quoting to allow newline escapes
+          pr_body=$'This pull request was created automatically because the scheduled sync from upstream failed.\n\n'
+          pr_body+=$'Repository: '
+          pr_body+="$GITHUB_REPOSITORY"
+          pr_body+=$'\nUpstream: '
+          pr_body+="$upstream_repo"
+          pr_body+=$'\nBranch: '
+          pr_body+="$branch"
+          pr_body+=$'\n\nThe histories appear to have diverged or contain merge conflicts.\nPlease review the changes in this PR, resolve any conflicts if GitHub reports them, and then merge to complete the sync.\n\nOnce merged, subsequent scheduled sync runs should succeed again.'
+
+          pr_url=$(gh pr create \
+            --title "Sync fork with upstream ($upstream_repo:$branch → $GITHUB_REPOSITORY:$branch)" \
+            --body "$pr_body" \
+            --base "$branch" \
+            --head "$pr_branch" \
+            --label "sync" 2>&1)
+
+          echo "$pr_url"
+          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update 'Fork Sync Failed' issue
+        if: failure() && steps.sync.outputs.success != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const labelName = 'sync-failure';
+            const defaultBranch = '${{ steps.repo-info.outputs.branch }}';
+
+            const message = `🚨 Fork sync failed
+
+            Repository: ${owner}/${repo}
+            Branch: ${defaultBranch}
+            Workflow run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}
+
+            The scheduled sync job could not automatically sync this fork from its upstream repository.
+
+            If a PR was created for manual resolution, please review and merge it.
+            Otherwise, check the workflow logs for details (merge conflicts, diverged history, or rate limits).`;
+
+            // Look for an open issue with the sync-failure label to avoid spamming
+            const issues = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              labels: labelName,
+            });
+
+            if (issues.data.length > 0) {
+              const issue = issues.data[0];
+              core.info(`Updating existing sync-failure issue #${issue.number}`);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: message,
+              });
+            } else {
+              core.info('Creating new sync-failure issue');
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title: 'Fork Sync Failed - Manual Intervention Required',
+                body: message,
+                labels: [labelName, 'needs-attention'],
+              });
+            }
+              
